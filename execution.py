@@ -683,6 +683,7 @@ class PromptExecutor:
             execution_list = ExecutionList(dynamic_prompt, self.caches.outputs)
             current_outputs = self.caches.outputs.all_node_ids()
             for node_id in list(execute_outputs):
+                logging.info(f"node_id: {node_id}")
                 execution_list.add_node(node_id)
 
             while not execution_list.is_empty():
