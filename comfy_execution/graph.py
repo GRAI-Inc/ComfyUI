@@ -1,6 +1,8 @@
 from __future__ import annotations
 from typing import Type, Literal
 
+import logging
+
 import nodes
 import asyncio
 import inspect
@@ -291,7 +293,8 @@ class ExecutionList(TopologicalSort):
         to_remove = [node_id for node_id in blocked_by if len(blocked_by[node_id]) == 0]
         while len(to_remove) > 0:
             for node_id in to_remove:
-                print(f'node_id: {node_id}')
+                # print(f'node_id: {node_id}')
+                logging.info(f"node_id: {node_id}")
                 for to_node_id in blocked_by:
                     if node_id in blocked_by[to_node_id]:
                         del blocked_by[to_node_id][node_id]
