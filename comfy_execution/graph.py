@@ -281,6 +281,12 @@ class ExecutionList(TopologicalSort):
         self.pop_node(node_id)
         self.staged_node_id = None
 
+    # Allow completing an arbitrary ready node by id (for parallel schedulers)
+    def complete_node_execution_for(self, node_id):
+        if node_id not in self.pendingNodes:
+            return
+        self.pop_node(node_id)
+
     def get_nodes_in_cycle(self):
         # We'll dissolve the graph in reverse topological order to leave only the nodes in the cycle.
         # We're skipping some of the performance optimizations from the original TopologicalSort to keep

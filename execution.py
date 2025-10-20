@@ -6,8 +6,9 @@ import sys
 import threading
 import time
 import traceback
+import os
 from enum import Enum
-from typing import List, Literal, NamedTuple, Optional, Union
+from typing import List, Literal, NamedTuple, Optional, Union, Set, Dict
 import asyncio
 
 import torch
@@ -27,6 +28,7 @@ from comfy_execution.graph import (
     ExecutionBlocker,
     ExecutionList,
     get_input_info,
+    DependencyCycleError,
 )
 from comfy_execution.graph_utils import GraphBuilder, is_link
 from comfy_execution.validation import validate_node_input
@@ -392,7 +394,7 @@ def format_value(x):
     else:
         return str(x)
 
-async def execute(server, dynprompt, caches, current_item, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes):
+async def execute(server, dynprompt, caches, current_item, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes, sched_lock: Optional[asyncio.Lock] = None):
     unique_id = current_item
     real_node_id = dynprompt.get_real_node_id(unique_id)
     display_node_id = dynprompt.get_display_node_id(unique_id)
@@ -468,8 +470,13 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
                     x not in input_data_all or x in missing_keys
                 )]
                 if len(required_inputs) > 0:
-                    for i in required_inputs:
-                        execution_list.make_input_strong_link(unique_id, i)
+                    if sched_lock is not None:
+                        async with sched_lock:
+                            for i in required_inputs:
+                                execution_list.make_input_strong_link(unique_id, i)
+                    else:
+                        for i in required_inputs:
+                            execution_list.make_input_strong_link(unique_id, i)
                     return (ExecutionResult.PENDING, None, None)
 
             def execution_block_cb(block):
@@ -496,7 +503,11 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
             output_data, output_ui, has_subgraph, has_pending_tasks = await get_output_data(prompt_id, unique_id, obj, input_data_all, execution_block_cb=execution_block_cb, pre_execute_cb=pre_execute_cb, hidden_inputs=hidden_inputs)
             if has_pending_tasks:
                 pending_async_nodes[unique_id] = output_data
-                unblock = execution_list.add_external_block(unique_id)
+                if sched_lock is not None:
+                    async with sched_lock:
+                        unblock = execution_list.add_external_block(unique_id)
+                else:
+                    unblock = execution_list.add_external_block(unique_id)
                 async def await_completion():
                     tasks = [x for x in output_data if isinstance(x, asyncio.Task)]
                     await asyncio.gather(*tasks, return_exceptions=True)
@@ -520,6 +531,7 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
             new_node_ids = []
             new_output_ids = []
             new_output_links = []
+            # Build the ephemeral graph and collect mutations first
             for i in range(len(output_data)):
                 new_graph, node_outputs = output_data[i]
                 if new_graph is None:
@@ -531,26 +543,44 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
                             raise DuplicateNodeError(f"Attempt to add duplicate node {node_id}. Ensure node ids are unique and deterministic or use graph_utils.GraphBuilder.")
                     for node_id, node_info in new_graph.items():
                         new_node_ids.append(node_id)
-                        display_id = node_info.get("override_display_id", unique_id)
-                        dynprompt.add_ephemeral_node(node_id, node_info, unique_id, display_id)
                         # Figure out if the newly created node is an output node
                         class_type = node_info["class_type"]
                         class_def = nodes.NODE_CLASS_MAPPINGS[class_type]
                         if hasattr(class_def, 'OUTPUT_NODE') and class_def.OUTPUT_NODE == True:
                             new_output_ids.append(node_id)
-                    for i in range(len(node_outputs)):
-                        if is_link(node_outputs[i]):
-                            from_node_id, from_socket = node_outputs[i][0], node_outputs[i][1]
+                    for j in range(len(node_outputs)):
+                        if is_link(node_outputs[j]):
+                            from_node_id, from_socket = node_outputs[j][0], node_outputs[j][1]
                             new_output_links.append((from_node_id, from_socket))
                     cached_outputs.append((True, node_outputs))
             new_node_ids = set(new_node_ids)
             for cache in caches.all:
                 subcache = await cache.ensure_subcache_for(unique_id, new_node_ids)
                 subcache.clean_unused()
-            for node_id in new_output_ids:
-                execution_list.add_node(node_id)
-            for link in new_output_links:
-                execution_list.add_strong_link(link[0], link[1], unique_id)
+            # Apply dynprompt and execution_list mutations under lock if available
+            if sched_lock is not None:
+                async with sched_lock:
+                    for i in range(len(output_data)):
+                        new_graph, node_outputs = output_data[i]
+                        if new_graph is not None:
+                            for node_id, node_info in new_graph.items():
+                                display_id = node_info.get("override_display_id", unique_id)
+                                dynprompt.add_ephemeral_node(node_id, node_info, unique_id, display_id)
+                    for node_id in new_output_ids:
+                        execution_list.add_node(node_id)
+                    for link in new_output_links:
+                        execution_list.add_strong_link(link[0], link[1], unique_id)
+            else:
+                for i in range(len(output_data)):
+                    new_graph, node_outputs = output_data[i]
+                    if new_graph is not None:
+                        for node_id, node_info in new_graph.items():
+                            display_id = node_info.get("override_display_id", unique_id)
+                            dynprompt.add_ephemeral_node(node_id, node_info, unique_id, display_id)
+                for node_id in new_output_ids:
+                    execution_list.add_node(node_id)
+                for link in new_output_links:
+                    execution_list.add_strong_link(link[0], link[1], unique_id)
             pending_subgraph_results[unique_id] = cached_outputs
             return (ExecutionResult.PENDING, None, None)
         caches.outputs.set(unique_id, output_data)
@@ -597,10 +627,12 @@ async def execute(server, dynprompt, caches, current_item, extra_data, executed,
     return (ExecutionResult.SUCCESS, None, None)
 
 class PromptExecutor:
-    def __init__(self, server, cache_type=False, cache_size=None):
+    def __init__(self, server, cache_type=False, cache_size=None, parallelism: Optional[int] = None):
         self.cache_size = cache_size
         self.cache_type = cache_type
         self.server = server
+        # Parallel execution cap; default 1 to preserve prior behavior
+        self.parallelism = parallelism or int(os.getenv("COMFY_EXEC_PARALLELISM", "1"))
         self.reset()
 
     def reset(self):
@@ -686,24 +718,92 @@ class PromptExecutor:
                 logging.info(f"node_id: {node_id}")
                 execution_list.add_node(node_id)
 
-            while not execution_list.is_empty():
-                node_id, error, ex = await execution_list.stage_node_execution()
-                if error is not None:
-                    self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
+            # Parallel scheduler
+            sched_lock = asyncio.Lock()
+            stop_flag = {"stop": False}
+            in_flight: Set[str] = set()
+            tasks: Dict[str, asyncio.Task] = {}
+            sem = asyncio.Semaphore(self.parallelism)
+
+            async def run_node(node_id: str):
+                await sem.acquire()
+                try:
+                    result, error, ex = await execute(
+                        self.server, dynamic_prompt, self.caches, node_id, extra_data,
+                        executed, prompt_id, execution_list, pending_subgraph_results,
+                        pending_async_nodes, sched_lock=sched_lock
+                    )
+                    self.success = result != ExecutionResult.FAILURE
+                    if result == ExecutionResult.FAILURE:
+                        current_outputs_local = self.caches.outputs.all_node_ids()
+                        self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs_local, executed, error, ex)
+                        stop_flag["stop"] = True
+                    elif result == ExecutionResult.SUCCESS:
+                        async with sched_lock:
+                            execution_list.complete_node_execution_for(node_id)
+                    else:
+                        # PENDING; unblockedEvent will handle readiness transition
+                        pass
+                finally:
+                    sem.release()
+                    in_flight.discard(node_id)
+                    tasks.pop(node_id, None)
+
+            async def schedule_ready():
+                ready = [n for n in execution_list.get_ready_nodes() if n not in in_flight]
+                for node_id in ready:
+                    if stop_flag["stop"]:
+                        break
+                    in_flight.add(node_id)
+                    tasks[node_id] = asyncio.create_task(run_node(node_id))
+
+            # Initial scheduling
+            await schedule_ready()
+
+            # Drive execution until done or error
+            while not stop_flag["stop"]:
+                if execution_list.is_empty() and not tasks:
                     break
 
-                assert node_id is not None, "Node ID should not be None at this point"
-                result, error, ex = await execute(self.server, dynamic_prompt, self.caches, node_id, extra_data, executed, prompt_id, execution_list, pending_subgraph_results, pending_async_nodes)
-                self.success = result != ExecutionResult.FAILURE
-                if result == ExecutionResult.FAILURE:
-                    self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error, ex)
+                # If nothing running, wait for an unblock (external async or subgraph)
+                if not tasks:
+                    await execution_list.unblockedEvent.wait()
+                    execution_list.unblockedEvent.clear()
+                    await schedule_ready()
+                    continue
+
+                # Wait for either a task to finish or an external unblock
+                unblock_task = asyncio.create_task(execution_list.unblockedEvent.wait())
+                wait_set = set(tasks.values()) | {unblock_task}
+                done, pending = await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+                if unblock_task in done:
+                    execution_list.unblockedEvent.clear()
+                # Schedule any new ready nodes
+                await schedule_ready()
+
+                # Detect cycle: no ready nodes, no tasks (after draining), no external blocks, but still nodes pending
+                if not tasks and not execution_list.is_empty() and execution_list.externalBlocks == 0:
+                    cycled_nodes = execution_list.get_nodes_in_cycle()
+                    blamed_node = cycled_nodes[0] if cycled_nodes else next(iter(execution_list.pendingNodes))
+                    for node_id in cycled_nodes:
+                        display_node_id = dynamic_prompt.get_display_node_id(node_id)
+                        if display_node_id != node_id:
+                            blamed_node = display_node_id
+                            break
+                    ex = DependencyCycleError("Dependency cycle detected")
+                    error_details = {
+                        "node_id": blamed_node,
+                        "exception_message": str(ex),
+                        "exception_type": "graph.DependencyCycleError",
+                        "traceback": [],
+                        "current_inputs": []
+                    }
+                    self.handle_execution_error(prompt_id, dynamic_prompt.original_prompt, current_outputs, executed, error_details, ex)
+                    stop_flag["stop"] = True
                     break
-                elif result == ExecutionResult.PENDING:
-                    execution_list.unstage_node_execution()
-                else: # result == ExecutionResult.SUCCESS:
-                    execution_list.complete_node_execution()
-            else:
-                # Only execute when the while-loop ends without break
+
+            if not stop_flag["stop"]:
+                # Only if the loop ended normally
                 self.add_message("execution_success", { "prompt_id": prompt_id }, broadcast=False)
 
             ui_outputs = {}
